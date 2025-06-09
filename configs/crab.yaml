@@ -1,0 +1,35 @@
+model:
+  hidden_dim: 256
+  num_layers: 8
+  num_charts: 8
+  c_pe_degree: 1
+  t_pe_degree: 4
+  s_pe_degree: 4
+
+train:
+  name: crab_model_uv_run_consistent
+  mesh_path: data/crab_VT.obj
+  epochs: 1
+  iters: 5000
+  G_num: 5000
+  T_num: 5000
+  triangle_num: 2048 # Number of triangles to sample for consistency loss
+  seed: 42
+  use_wandb: False
+
+loss:
+  three_two_three: 1
+  two_three_two: 1
+  entropy: 0.04
+  surface: 10
+  cluster: 0.5
+  conformal: 0.4
+  stretch: 0.1
+  texture: 1.0
+  triangle_consistency: 1.0
+
+optimizer:
+  nuvo_lr: 1e-4
+  sigma_lr: 0.1
+  normal_grids_lr: 0.04
+  rgb_grids_lr: 0.04

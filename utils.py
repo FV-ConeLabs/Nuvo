@@ -300,3 +300,21 @@ def bilinear_interpolation(grid, uvs):
 
     interpolated = F.grid_sample(grid_tensor, uvs_tensor, align_corners=True, mode='bilinear')
     return interpolated.permute(3, 1, 2, 0).squeeze(-1).squeeze(-1)  # Shape: (N, C)
+
+
+def sample_triangles(mesh, num_triangles, device):
+    """
+    Samples random triangles from a mesh and returns their vertex coordinates.
+
+    :param mesh: A trimesh object.
+    :param num_triangles: The number of triangles to sample.
+    :param device: The torch device to place the tensor on.
+    :return: A tensor of sampled triangle vertices of shape (num_triangles, 3, 3).
+    """
+    # Sample triangle indices uniformly by area to be representative
+    face_indices = mesh.sample(num_triangles, return_index=True)[1]
+    
+    # Get the vertices for these triangles
+    tri_verts = mesh.vertices[mesh.faces[face_indices]]
+    
+    return torch.tensor(tri_verts, dtype=torch.float32, device=device)

@@ -8,11 +8,13 @@ from torchvision.utils import make_grid
 import argparse
 from tqdm import tqdm
 from omegaconf import OmegaConf
+import numpy as np
 
 from network import Nuvo
 from utils import (
     sample_points_on_mesh,
     sample_uv_points,
+    sample_triangles,
     create_rgb_maps,
     set_all_seeds,
     normalize_mesh,
@@ -65,21 +67,28 @@ def main(config_path: str):
     # load mesh
     mesh = trimesh.load_mesh(conf.train.mesh_path)
     mesh = normalize_mesh(mesh)
-    mesh = mesh.subdivide()
+    # print(f"Mesh has {len(mesh.vertices)} vertices. Subdividing...")
+    # mesh = mesh.subdivide()
+    # print(f"After subdivision, mesh has {len(mesh.vertices)} vertices.")
 
     # train loop
     for epoch in range(conf.train.epochs):
-        for i in tqdm(range(start_iteration, conf.train.iters)):
+        for i in tqdm(range(start_iteration, conf.train.iters), desc=f"Epoch {epoch+1}/{conf.train.epochs}"):
             optimizer_nuvo.zero_grad()
             optimizer_sigma.zero_grad()
             optimizer_normal_maps.zero_grad()
 
             # sample points on mesh and UV points
             points, normals = sample_points_on_mesh(mesh, conf.train.G_num)
-            uvs = sample_uv_points(conf.train.G_num)
+            uvs = sample_uv_points(conf.train.T_num)
             points = torch.tensor(points, dtype=torch.float32, device=device)
             normals = torch.tensor(normals, dtype=torch.float32, device=device)
             uvs = torch.tensor(uvs, dtype=torch.float32, device=device)
+
+            # Sample triangles for consistency loss
+            tri_verts = None
+            if conf.loss.get("triangle_consistency", 0.0) > 0:
+                tri_verts = sample_triangles(mesh, conf.train.triangle_num, device)
 
             # compute losses
             loss_dict = compute_loss(
@@ -90,6 +99,7 @@ def main(config_path: str):
                 model,
                 sigma,
                 normal_maps,
+                tri_verts,
             )
 
             loss_dict["loss_combined"].backward()
@@ -118,7 +128,6 @@ def main(config_path: str):
                         }
                     )
 
-                    # use wandb to save the mesh
                     mesh_path = os.path.join(wandb.run.dir, f"mesh_{epoch}_{i}.obj")
                     new_mesh.export(mesh_path)
             else:
@@ -126,28 +135,8 @@ def main(config_path: str):
                     print(
                         f"Epoch: {epoch}, Iter: {i}, Total Loss: {loss_dict['loss_combined'].item()}"
                     )
-
-            if (i + 1) % 2000 == 0:
-                vertices = torch.tensor(mesh.vertices, dtype=torch.float32, device=device)
-                chart_indices = model.chart_assignment_mlp(vertices).argmax(dim=1)
-                uvs = model.texture_coordinate_mlp(vertices, chart_indices)
-                    
-                # tile the uvs
-                uvs = uvs.detach().cpu().numpy()
-                # add the chart_indices to the uvs, and then normalize the uvs
-                chart_indices = chart_indices.detach().cpu().numpy()
-                uvs[:, 0] = uvs[:, 0] + chart_indices
-                uvs[:, 0] = uvs[:, 0] / conf.model.num_charts
-                # create object with uvs, vertices, faces
-                texvisuals = trimesh.visual.TextureVisuals(uv=uvs)
-                mesh = trimesh.Trimesh(vertices=vertices.cpu().numpy(), faces=mesh.faces, visual=texvisuals)
-                mesh.export("output/final_mesh.obj")
-
-    # save model 
-    # if conf.train.use_wandb:
-    #     model_path = os.path.join(wandb.run.dir, "final_model.ckpt")
-    #     torch.save(model.state_dict(), model_path)
-            if i == (conf.train.iters - 1) and (epoch == conf.train.epochs - 1):
+            
+            if (i + 1) % conf.train.iters == 0:
                 ckpt = {
                     "model_state_dict": model.state_dict(),
                     "optimizer_nuvo_state_dict": optimizer_nuvo.state_dict(),
@@ -158,24 +147,88 @@ def main(config_path: str):
                     "epoch": epoch,
                     "iteration": i,
                 }
+                os.makedirs("output", exist_ok=True)
                 torch.save(ckpt, f"output/checkpoint_{epoch}_{i}.ckpt")
         
-    # save mesh 
-    # compute uvs
-    vertices = torch.tensor(mesh.vertices, dtype=torch.float32, device=device)
-    chart_indices = model.chart_assignment_mlp(vertices).argmax(dim=1)
-    uvs = model.texture_coordinate_mlp(vertices, chart_indices)
-    
-    # tile the uvs
-    uvs = uvs.detach().cpu().numpy()
-    # add the chart_indices to the uvs, and then normalize the uvs
-    chart_indices = chart_indices.detach().cpu().numpy()
-    uvs[:, 0] = uvs[:, 0] + chart_indices
-    uvs[:, 0] = uvs[:, 0] / conf.model.num_charts
-    # create object with uvs, vertices, faces
-    texvisuals = trimesh.visual.TextureVisuals(uv=uvs)
-    mesh = trimesh.Trimesh(vertices=vertices.cpu().numpy(), faces=mesh.faces, visual=texvisuals)
-    mesh.export("output/final_mesh.obj")
+    # --- START: NEW FINAL MESH EXPORT LOGIC ---
+    print("Training finished. Starting final UV generation for all vertices...")
+    # Use the same mesh that was used for training
+    final_export_mesh = mesh
+
+    vertices = torch.tensor(final_export_mesh.vertices, dtype=torch.float32, device=device)
+    faces = torch.tensor(final_export_mesh.faces, dtype=torch.int64, device=device)
+    num_vertices = vertices.shape[0]
+    num_faces = faces.shape[0]
+    inference_batch_size = 10000
+
+    # 1. Get chart probabilities for all vertices
+    print(f"Processing {num_vertices} vertices to get chart probabilities...")
+    all_chart_probs = []
+    with torch.no_grad():
+        model.eval()
+        for i in tqdm(range(0, num_vertices, inference_batch_size), desc="Vertex Chart Probs"):
+            batch_vertices = vertices[i:i + inference_batch_size]
+            batch_chart_probs = model.chart_assignment_mlp(batch_vertices)
+            all_chart_probs.append(batch_chart_probs)
+    chart_probs = torch.cat(all_chart_probs, dim=0)
+
+    # 2. Determine a chart for each FACE (triangle) using majority vote
+    print(f"Assigning charts to {num_faces} faces by majority vote...")
+    face_vert_probs = chart_probs[faces]            # Shape: [num_faces, 3, num_charts]
+    summed_face_probs = torch.sum(face_vert_probs, dim=1) # Sum probs across vertices
+    face_chart_indices = torch.argmax(summed_face_probs, dim=1) # Shape: [num_faces]
+
+    # 3. Create a new "unwelded" mesh to handle UV seams
+    print("Unwelding mesh and calculating per-corner UVs...")
+    final_vertices_tensor = vertices[faces].reshape(-1, 3)
+    final_faces_tensor = torch.arange(len(final_vertices_tensor), device=device).view(-1, 3)
+
+    # 4. Calculate UVs for each new vertex (face corner) based on its face's chart
+    final_uvs_tensor = torch.zeros(final_vertices_tensor.shape[0], 2, device=device)
+    with torch.no_grad():
+        for chart_idx in tqdm(range(conf.model.num_charts), desc="Calculating UVs per chart"):
+            mask = (face_chart_indices == chart_idx)
+            if not mask.any():
+                continue
+
+            all_corner_indices_in_chart = final_faces_tensor[mask].reshape(-1)
+            all_corners_to_process = final_vertices_tensor[all_corner_indices_in_chart]
+
+            num_corners_in_chart = len(all_corners_to_process)
+
+            for i in range(0, num_corners_in_chart, inference_batch_size):
+                batch_corner_indices = all_corner_indices_in_chart[i:i + inference_batch_size]
+                batch_corners = all_corners_to_process[i:i + inference_batch_size]
+
+                chart_ids_for_mlp = torch.full((len(batch_corners),), fill_value=chart_idx, device=device, dtype=torch.long)
+
+                uv_coords = model.texture_coordinate_mlp(batch_corners, chart_ids_for_mlp)
+
+                final_uvs_tensor[batch_corner_indices] = uv_coords
+
+    # 5. Tile the UVs into a single atlas layout
+    print("Tiling UVs into atlas layout...")
+    uvs_np = final_uvs_tensor.cpu().numpy()
+    vertex_chart_indices = torch.repeat_interleave(face_chart_indices, 3).cpu().numpy()
+
+    uvs_np[:, 0] = (uvs_np[:, 0] + vertex_chart_indices) / conf.model.num_charts
+    uvs_np = np.clip(uvs_np, 0.0, 1.0) # Ensure UVs are in the valid [0,1] range
+
+    # 6. Create and export the final Trimesh object
+    print("Creating final Trimesh object...")
+    tex_visuals = trimesh.visual.TextureVisuals(uv=uvs_np)
+    final_mesh = trimesh.Trimesh(vertices=final_vertices_tensor.cpu().numpy(),
+                                   faces=final_faces_tensor.cpu().numpy(),
+                                   visual=tex_visuals,
+                                   process=False) # Disable processing to keep unwelded vertices
+
+    export_path = "output/final_mesh_consistent.obj"
+    os.makedirs("output", exist_ok=True)
+    print(f"Exporting final mesh with consistent UVs to {export_path}...")
+    final_mesh.export(export_path)
+    print("Export complete!")
+    # --- END: NEW FINAL MESH EXPORT LOGIC ---
+
 
 if __name__ == "__main__":
     args = argparse.ArgumentParser()
